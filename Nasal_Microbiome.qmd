@@ -1,0 +1,766 @@
+---
+title: "Microbiome in diffuse type 2 chronic rhinosinusitis"
+date: "`r date()`"
+author: Fabio Ryser
+format:
+  html:
+    theme: default
+    toc: true
+    embed-resources: true
+    code-fold: show
+---
+
+## Introduction
+
+In the IMMUNOPOLYP study we sampled 27 patients with chronic rhinosinusitis treated with dupilumab 300mg s.c. every other week. We collected nasal swabs and stool samples during the course of treatment. We performed 16S shotgun-metagenomics analysis.
+
+## Load packages
+
+Prior to the metagenomics data analysis we load all necessary packages.
+
+```{r}
+#| output: false
+library(openxlsx)
+library(DECIPHER)
+library(dada2)
+library(readr)
+library(seqinr)
+library(phyloseq)
+library(vegan)
+library(ggplot2)
+library(viridis)
+library(dplyr)
+library(gss)
+library(coda4microbiome)
+library(pheatmap)
+library(ggpubr)
+library(microbiome)
+library(mia)
+library(ggrepel)
+library(metagenomeSeq)
+library(MicrobiomeStat)
+library(RColorBrewer)
+library(DESeq2)
+library(rstatix)
+library(tidyr)
+```
+
+## Data import
+
+For further information about cleaning data and the preliminary analysis of ASV signals please refer to [DADA2 package](https://www.bioconductor.org/packages/release/bioc/html/dada2.html) and the corresponding tutorials on the [github page](https://benjjneb.github.io/dada2/tutorial.html).
+The data provided in this example have already been cleaned and the taxonomy assignement has been conducted.
+We start by load the packaged ASV counts without contamination and the ASV taxonomy as well as the sample metadata.
+
+```{r}
+#| output: false
+# load our ASV count data from the shotgun metagenomic analysis
+count_tab <- read.table("//filer300/USERS3001/I0331555/Documents/IMMUNOPOLYP/MIKROPOLYP/ASVs_counts-no-contam.tsv", header=T, row.names=1,
+                        check.names=F, sep="\t")
+
+# load our taxnomy table (output of the assinging taxonomy according to DADA2 package)
+tax_tab <- as.matrix(read.table("//filer300/USERS3001/I0331555/Documents/IMMUNOPOLYP/MIKROPOLYP/ASVs_taxonomy.tsv", header=T,
+                                row.names=1, check.names=F, sep="\t"))
+# match ASV to the taxonomy
+ASV <- rownames(count_tab)
+tax_tab <- cbind(tax_tab, ASV)
+tax_tab <- as.data.frame(tax_tab)
+rownames(tax_tab) <- tax_tab$ASV
+# save as matrix for later
+tax_tab <- as.matrix(tax_tab)
+
+# load the sample information data (only nasal samples)
+sample1 <- read.xlsx("//filer300/USERS3001/I0331555/Documents/IMMUNOPOLYP/MIKROPOLYP/sample_information_nasal.xlsx")
+
+sample_info_tab <- read.table("//filer300/USERS3001/I0331555/Documents/IMMUNOPOLYP/MIKROPOLYP/sample_information_nasal.tsv", header=T, row.names=1,
+                              check.names=F, sep="\t")
+
+# load the sample information for stool samples
+sample_info_stool <- read.table("//filer300/USERS3001/I0331555/Documents/IMMUNOPOLYP/MIKROPOLYP/sample_information_stool.tsv", header=T, row.names=1,
+                              check.names=F, sep="\t")
+sample2 <- read.xlsx("//filer300/USERS3001/I0331555/Documents/IMMUNOPOLYP/MIKROPOLYP/sample_information_stool.xlsx")
+
+# merge all stool sample data to one dataframe
+sample_info_stool$SampleID <- rownames(sample_info_stool)
+sample_info_stool <- merge(sample_info_stool, sample2, by = "treat")
+rownames(sample_info_stool) <- sample_info_stool$SampleID
+sample_info_stool$Time <- factor(sample_info_stool$Time, levels = c("healthy", "0", "28", "90", "180"))
+
+# merge all nasal sample data to one dataframe
+sample_info_tab$SampleID <- rownames(sample_info_tab)
+sample_info_tab <- merge(sample_info_tab, sample1, by = "treat")
+rownames(sample_info_tab) <- sample_info_tab$SampleID
+sample_info_tab$Time <- factor(sample_info_tab$Time, levels = c("healthy", "0", "28", "90", "180"))
+
+# subset the count table to only nasal microbiome and exclude all stool samples
+count_tab_nasal <- count_tab[, colnames(count_tab) %in% sample_info_tab$SampleID]
+
+# subset the count table to only stool microbiome and exclude all stool samples
+count_tab_stool <- count_tab[, colnames(count_tab) %in% sample_info_stool$SampleID]
+count_tab_stool <- as.data.frame(count_tab_stool)
+
+```
+
+## Designing a phyloseq object
+
+To proceed with the microbiome analysis we use the phyloseq package and design a phyloseq object with the count table, taxonomy table and the sample data.
+
+```{r}
+#| output: false
+# assign the right tables to the right matrices
+count_tab_phy <- otu_table(count_tab_nasal, taxa_are_rows=T)
+tax_tab_phy <- tax_table(tax_tab)
+sample_info_tab_phy <- sample_data(sample_info_tab)
+
+# merge all table to a S4 object
+ASV_physeq <- phyloseq(count_tab_phy, tax_tab_phy, sample_info_tab_phy)
+```
+
+We do the same for our stool samples. 
+
+```{r}
+#| output: false
+# assign the right tables to the right matrices
+count_tab_phy_stool <- otu_table(count_tab_stool, taxa_are_rows=T)
+tax_tab_phy_stool <- tax_table(tax_tab)
+sample_info_tab_phy_stool <- sample_data(sample_info_stool)
+
+# merge all table to a S4 object
+ASV_physeq_stool <- phyloseq(count_tab_phy_stool, tax_tab_phy_stool, sample_info_tab_phy_stool)
+```
+
+# Alpha Diversity
+
+Because the cleaning of the data has already been done in the preliminary analysis using DADA2 package, we can start straight forward with the analysis of the alpha diversity following the [phyloseq workflow](https://joey711.github.io/phyloseq/plot_richness-examples.html) and the [microbiome worflow](https://microbiome.github.io/tutorials/).
+
+```{r}
+#| fig-label: diversity
+#| fig-width: 8
+#| fig-length: 20
+#| fig-cap: "Shannon diversity in nasal microbiome in patients with diffuse type 2 chronic rhinosinusitis under dupilumab treatment and healthy controls."
+# create boxplot including shannon diversity with wilcoxan rank test
+p.shannon <- boxplot_alpha(ASV_physeq, 
+                           index = "shannon",
+                           x_var = "Time") +
+  stat_compare_means(method = "wilcox", step.increase = 0.06, 
+                     comparisons = list(c("healthy", "0"), c("healthy", "28"), c("healthy", "90"), c("healthy", "180"), c("0", "28"), c("0", "90"), c("0", "180"))) +
+  scale_fill_viridis(discrete = TRUE, alpha = 1, option="viridis")+
+  theme_bw()+
+  ylab("Shannon-Diversity")+
+  labs(title = "Nasal Microbiome")
+
+p.chao <- boxplot_alpha(ASV_physeq, 
+                           index = "chao1",
+                           x_var = "Time") +
+  stat_compare_means(method = "wilcox", step.increase = 0.06, 
+                     comparisons = list(c("healthy", "0"), c("healthy", "28"), c("healthy", "90"), c("healthy", "180"), c("0", "28"), c("0", "90"), c("0", "180"))) +
+  scale_fill_viridis(discrete = TRUE, alpha = 1, option="viridis")+
+  theme_bw()+
+  ylab("Chao1-Diversity")+
+  labs(title = "Nasal Microbiome")
+```
+
+We do the same analysis for our stool samples. Then we arrange the two plots in one.
+
+```{r}
+#| fig-label: diversity
+#| fig-width: 8
+#| fig-length: 20
+#| fig-cap: "Shannon diversity in nasal and gut microbiome in patients with diffuse type 2 chronic rhinosinusitis under dupilumab treatment and healthy controls."
+
+# create boxplot including shannon diversity with wilcoxan rank test
+p.shannon_stool <- boxplot_alpha(ASV_physeq_stool, 
+                           index = "shannon",
+                           x_var = "Time") +
+  stat_compare_means(method = "wilcox", step.increase = 0.06, 
+                     comparisons = list(c("healthy", "0"), c("healthy", "28"), c("healthy", "90"), c("healthy", "180"), c("0", "28"), c("0", "90"), c("0", "180"))) +
+  scale_fill_viridis(discrete = TRUE, alpha = 1, option="viridis")+
+  theme_bw()+
+  ylab("Shannon-Diversity")+
+  labs(title = "Intestinal Microbiome")
+
+p.chao_stool <- boxplot_alpha(ASV_physeq_stool, 
+                           index = "chao1",
+                           x_var = "Time") +
+  stat_compare_means(method = "wilcox", step.increase = 0.06, 
+                     comparisons = list(c("healthy", "0"), c("healthy", "28"), c("healthy", "90"), c("healthy", "180"), c("0", "28"), c("0", "90"), c("0", "180"))) +
+  scale_fill_viridis(discrete = TRUE, alpha = 1, option="viridis")+
+  theme_bw()+
+  ylab("Chao1-Diversity")+
+  labs(title = "Intestinal Microbiome")
+
+legend <- get_legend(p.shannon)
+div <- ggarrange(p.shannon, p.chao, p.shannon_stool, p.chao_stool, nrow = 1, ncol = 4, legend = "none")
+div
+```
+
+The alpha diversity decreases significantly under dupilumab therapy. 
+
+# Beta diversity
+
+Now we conduct beta-diversity as instructed on the github webpage [course_2021_radboud](https://microbiome.github.io/course_2021_radboud/beta-diversity.html#examples-of-pcoa-with-different-settings).
+
+We use Bray-Curtis distance for this analysis.
+
+```{r}
+#| fig-width: 12
+#| fig-length: 6
+#| fig-cap: "Bray-Curtis analysis nasal"
+# with the phyloseq package we design a beta diversity plot
+bray <- ordinate(ASV_physeq, method = "PCoA", distance = "bray")
+beta1 <- plot_ordination(physeq = ASV_physeq, ordination = bray, color = "Time")+
+  geom_point(size = 4)+
+  stat_ellipse()+
+  scale_color_viridis(discrete = TRUE)+
+  theme_bw()
+
+bray_stool <- ordinate(ASV_physeq_stool, method = "PCoA", distance = "bray")
+beta2 <- plot_ordination(physeq = ASV_physeq_stool, ordination = bray_stool, color = "Time")+
+  geom_point(size = 4)+
+  stat_ellipse()+
+  scale_color_viridis(discrete = TRUE)+
+  theme_bw()
+
+bt <- ggarrange(beta1, beta2, ncol =2)
+bt
+```
+
+
+```{r}
+#| output: false
+# now we calculate the bray distance to test using PERMANOVA testing with 999 permutations.
+abrel_bray <- phyloseq::distance(ASV_physeq, method = "bray")
+sam <- data.frame(sample_data(ASV_physeq))
+abrel_bray <- as.matrix(abrel_bray)
+
+# our permanova test for healthy vs. CRS
+sam_CRS <- sam[!is.na(sam$CRS_healthy), ]
+abrel_bray_CRS <- abrel_bray[rownames(abrel_bray) %in% sam_CRS$SampleID, colnames(abrel_bray) %in% sam_CRS$SampleID]
+permanova <- adonis2(abrel_bray_CRS ~ CRS_healthy, data = sam_CRS)
+
+# our permanova test for healthy vs. d28
+sam_CRS_d28 <- sam[!is.na(sam$healtyh_d28), ]
+abrel_bray_CRS_d28 <- abrel_bray[rownames(abrel_bray) %in% sam_CRS_d28$SampleID, colnames(abrel_bray) %in% sam_CRS_d28$SampleID]
+permanova <- adonis2(abrel_bray_CRS_d28 ~ healtyh_d28, data = sam_CRS_d28)
+
+# our permanova test for healthy vs. d90
+sam_CRS_d90 <- sam[!is.na(sam$healthy_d90), ]
+abrel_bray_CRS_d90 <- abrel_bray[rownames(abrel_bray) %in% sam_CRS_d90$SampleID, colnames(abrel_bray) %in% sam_CRS_d90$SampleID]
+permanova <- adonis2(abrel_bray_CRS_d90 ~ healthy_d90, data = sam_CRS_d90)
+
+# our permanova test for healthy vs. d180
+sam_180 <- sam[!is.na(sam$healthy_d180), ]
+abrel_bray_180 <- abrel_bray[rownames(abrel_bray) %in% sam_180$SampleID, colnames(abrel_bray) %in% sam_180$SampleID]
+permanova2 <- adonis2(abrel_bray_180 ~ healthy_d180, data = sam_180)
+
+# our permanova test for d0 vs. d28
+sam_28 <- sam[!is.na(sam$d0_d28), ]
+abrel_bray_28 <- abrel_bray[rownames(abrel_bray) %in% sam_28$SampleID, colnames(abrel_bray) %in% sam_28$SampleID]
+permanova2 <- adonis2(abrel_bray_28 ~ d0_d28, data = sam_28)
+
+# our permanova test for d0 vs. d90
+sam_90 <- sam[!is.na(sam$d0_d90), ]
+abrel_bray_90 <- abrel_bray[rownames(abrel_bray) %in% sam_90$SampleID, colnames(abrel_bray) %in% sam_90$SampleID]
+permanova2 <- adonis2(abrel_bray_90 ~ d0_d90, data = sam_90)
+
+# our permanova test for d0 vs. d180
+sam_180 <- sam[!is.na(sam$d0_180), ]
+abrel_bray_180 <- abrel_bray[rownames(abrel_bray) %in% sam_180$SampleID, colnames(abrel_bray) %in% sam_180$SampleID]
+permanova2 <- adonis2(abrel_bray_180 ~ d0_180, data = sam_180)
+```
+
+```{r}
+#| output: false
+# we do the same PERMANOVA analysis with the stool probes to test for similarity of the samples.
+
+# now we calculate the bray distance to test using PERMANOVA testing with 999 permutations.
+abrel_bray <- phyloseq::distance(ASV_physeq_stool, method = "bray")
+sam <- data.frame(sample_data(ASV_physeq_stool))
+abrel_bray <- as.matrix(abrel_bray)
+
+# our permanova test for healthy vs. CRS
+sam_CRS <- sam[!is.na(sam$CRS_healthy), ]
+abrel_bray_CRS <- abrel_bray[rownames(abrel_bray) %in% sam_CRS$SampleID, colnames(abrel_bray) %in% sam_CRS$SampleID]
+permanova <- adonis2(abrel_bray_CRS ~ CRS_healthy, data = sam_CRS)
+
+# our permanova test for healthy vs. d28
+sam_CRS_d28 <- sam[!is.na(sam$healtyh_d28), ]
+abrel_bray_CRS_d28 <- abrel_bray[rownames(abrel_bray) %in% sam_CRS_d28$SampleID, colnames(abrel_bray) %in% sam_CRS_d28$SampleID]
+permanova <- adonis2(abrel_bray_CRS_d28 ~ healtyh_d28, data = sam_CRS_d28)
+
+# our permanova test for healthy vs. d90
+sam_CRS_d90 <- sam[!is.na(sam$healthy_d90), ]
+abrel_bray_CRS_d90 <- abrel_bray[rownames(abrel_bray) %in% sam_CRS_d90$SampleID, colnames(abrel_bray) %in% sam_CRS_d90$SampleID]
+permanova <- adonis2(abrel_bray_CRS_d90 ~ healthy_d90, data = sam_CRS_d90)
+
+# our permanova test for healthy vs. d180
+sam_180 <- sam[!is.na(sam$healthy_d180), ]
+abrel_bray_180 <- abrel_bray[rownames(abrel_bray) %in% sam_180$SampleID, colnames(abrel_bray) %in% sam_180$SampleID]
+permanova2 <- adonis2(abrel_bray_180 ~ healthy_d180, data = sam_180)
+
+# our permanova test for d0 vs. d28
+sam_28 <- sam[!is.na(sam$d0_d28), ]
+abrel_bray_28 <- abrel_bray[rownames(abrel_bray) %in% sam_28$SampleID, colnames(abrel_bray) %in% sam_28$SampleID]
+permanova2 <- adonis2(abrel_bray_28 ~ d0_d28, data = sam_28)
+
+# our permanova test for d0 vs. d90
+sam_90 <- sam[!is.na(sam$d0_d90), ]
+abrel_bray_90 <- abrel_bray[rownames(abrel_bray) %in% sam_90$SampleID, colnames(abrel_bray) %in% sam_90$SampleID]
+permanova2 <- adonis2(abrel_bray_90 ~ d0_d90, data = sam_90)
+
+# our permanova test for d0 vs. d180
+sam_180 <- sam[!is.na(sam$d0_180), ]
+abrel_bray_180 <- abrel_bray[rownames(abrel_bray) %in% sam_180$SampleID, colnames(abrel_bray) %in% sam_180$SampleID]
+permanova2 <- adonis2(abrel_bray_180 ~ d0_180, data = sam_180)
+```
+The permanova test for healthy vs CRS is significant with a F value of 1.864 and p-value 0.011. This means the centroid of the two clusters are not the same and are significantly different from each other.
+
+### nasal microbiome
+| Test           | F-value | p-value |
+|----------------|---------|---------|
+|healthy vs. CRS |1.864    |0.015*  
+|healthy vs. d28 |3.067    |0.001***
+|healthy vs. d90 |2.941    |0.001***
+|healthy vs. d180|2.342    |0.003**
+|d0 vs. d28      |0.892    |0.572
+|d0 vs. d90      |1.036    |0.373
+|d0 vs. d180     |1.391    |0.105
+
+### stool microbiome
+| Test           | F-value | p-value |
+|----------------|---------|---------|
+|healthy vs. CRS |2.816    |0.001*** 
+|healthy vs. d28 |2.372    |0.001***
+|healthy vs. d90 |2.087    |0.002**
+|healthy vs. d180|1.725    |0.015*
+|d0 vs. d28      |0.877    |0.691
+|d0 vs. d90      |0.864    |0.748
+|d0 vs. d180     |0.848    |0.769
+
+# Compositional Data
+
+The next step is the evaluation of compositional data. We plot a stacked barplot to show the different genera in the nasal microbiome.
+
+```{r}
+#| fig-width: 12
+#| fig-length: 6
+#| fig-cap: "compositional data of *genera* level in the nasal microbiome of patients with chronic rhinosinusitis under dupilumab treatement"
+
+# first make sure to use the right transform function
+transform <- microbiome::transform
+
+# use the abundance
+pseq <- transform(ASV_physeq, "compositional")
+pseq <- aggregate_rare(pseq, level = "Genus", detection = 1/100, prevalence = 20/100)
+
+p1 <- plot_composition(pseq,
+                      average_by = "Time", 
+                      transform = "compositional") +
+  scale_fill_viridis(discrete = TRUE, option = "H") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1),
+        legend.text = element_text(face = "italic"))+
+  labs(title = "Nasal Microbiome")
+
+# use the abundance
+pseq_stool <- transform(ASV_physeq_stool, "compositional")
+pseq_stool <- aggregate_rare(pseq_stool, level = "Genus", detection = 1/50, prevalence = 20/100)
+
+p2 <- plot_composition(pseq_stool,
+                      average_by = "Time", 
+                      transform = "compositional") +
+  scale_fill_viridis(discrete = TRUE, option = "H") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1),
+        legend.text = element_text(face = "italic"))+
+  labs(title = "Intestinal Microbiome")
+
+par <- ggarrange(p1, p2, ncol = 2)
+par
+```
+
+The compositional data of the nasal microbiome shows a higher relative abundance of *Corynebacterium* in healthy controls compared to patients suffering from CRSwNP. On the other hand, the *Staphylococcus* genus level seems higher in CRSwNP patients.
+Comparing the stool microbiome, the *Bifidobacterium* are increased in healthy controls.
+
+# Differential Abundance Analysis
+
+To compare the different abundance of bacteria in the nasal microbiome. We conducted the analysis as described on the [DESeq2 homepage](https://joey711.github.io/phyloseq-extensions/DESeq2.html).
+
+```{r}
+# now we do the differential abundance analysis with the DESeq2 package
+# we
+ASV_CRS_healthy <- subset_samples(ASV_physeq, !is.na(CRS_healthy))
+sample_data(ASV_CRS_healthy)$CRS_healthy <- as.factor(sample_data(ASV_CRS_healthy)$CRS_healthy)
+# first we design a deseq2 object
+diagdds = phyloseq_to_deseq2(ASV_CRS_healthy, ~ CRS_healthy)
+diagdds = DESeq(diagdds, test="Wald", fitType="parametric")
+
+res = results(diagdds, cooksCutoff = FALSE)
+alpha = 0.01
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ASV_physeq)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+``` 
+
+```{r}
+#| fig-width: 8
+#| fig-length: 8
+#| fig-cap: "Bray-Curtis analysis nasal"
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+gg1 <- ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=padj)) + 
+  geom_point(size=6) + 
+  scale_x_discrete(guide = guide_axis(angle = -90))+
+  theme_bw()+
+  labs(title="healthy vs. CRS")+
+  scale_color_viridis()
+```
+
+
+```{r}
+#| fig-width: 8
+#| fig-length: 8
+# we add the siginificant ASV levels to our source data and plot the genus levels
+MR_nasal <- count_tab_nasal[rownames(count_tab_nasal) %in% sigtab$ASV, ]
+MR_tax_nasal <- tax_tab[rownames(tax_tab) %in% sigtab$ASV, ]
+
+MR_count <- otu_table(MR_nasal, taxa_are_rows=T)
+MR_tax <- tax_table(MR_tax_nasal)
+sample_info_tab_phy <- sample_data(sample_info_tab)
+
+MR_phy <- phyloseq(MR_count, MR_tax, sample_info_tab_phy)
+transform <- microbiome::transform
+pseq <- transform(MR_phy, "compositional")
+pseq <- aggregate_rare(pseq, level = "Genus", detection = 1/100, prevalence = 20/100)
+
+ps <- tax_glom(pseq, "Genus")
+taxa_names(ps) <- tax_table(ps)[, "Genus"]
+
+psmelt <- psmelt(ps)
+psmelt <- psmelt[!is.na(psmelt$CRS_healthy),]
+psmelt$CRS_healthy <- as.factor(psmelt$CRS_healthy)
+
+g1 <- ggplot(data = psmelt, aes(x = CRS_healthy, y = Abundance, fill = OTU)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = OTU), height = 0, width = .3) +
+  labs(x = "", y = "Abundance\n", title = "Healthy vs. CRS nasal microbiome: Genera") +
+  facet_wrap(~ OTU, scales = "free")+
+  theme_bw()+
+  scale_fill_viridis(discrete = TRUE, alpha = 0.7, option="viridis")+
+  scale_color_viridis(discrete = TRUE, alpha = 0.7, option="viridis")
+g1
+psmelt1 <- psmelt
+```
+
+```{r}
+# now we do the differential abundance analysis with the DESeq2 package
+# we
+ASV_d28_healthy <- subset_samples(ASV_physeq, !is.na(healtyh_d28))
+sample_data(ASV_d28_healthy)$healtyh_d28 <- as.factor(sample_data(ASV_d28_healthy)$healtyh_d28)
+# first we design a deseq2 object
+diagdds = phyloseq_to_deseq2(ASV_d28_healthy, ~ healtyh_d28)
+diagdds = DESeq(diagdds, test="Wald", fitType="parametric")
+
+res = results(diagdds, cooksCutoff = FALSE)
+alpha = 0.01
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ASV_physeq)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+``` 
+
+```{r}
+#| fig-width: 8
+#| fig-length: 8
+# we add the siginificant ASV levels to our source data and plot the genus levels
+MR_nasal <- count_tab_nasal[rownames(count_tab_nasal) %in% sigtab$ASV, ]
+MR_tax_nasal <- tax_tab[rownames(tax_tab) %in% sigtab$ASV, ]
+
+MR_count <- otu_table(MR_nasal, taxa_are_rows=T)
+MR_tax <- tax_table(MR_tax_nasal)
+sample_info_tab_phy <- sample_data(sample_info_tab)
+
+MR_phy <- phyloseq(MR_count, MR_tax, sample_info_tab_phy)
+transform <- microbiome::transform
+pseq <- transform(MR_phy, "compositional")
+pseq <- aggregate_rare(pseq, level = "Genus", detection = 1/100, prevalence = 20/100)
+
+ps <- tax_glom(pseq, "Genus")
+taxa_names(ps) <- tax_table(ps)[, "Genus"]
+
+psmelt <- psmelt(ps)
+psmelt <- psmelt[!is.na(psmelt$healtyh_d28),]
+psmelt$healtyh_d28 <- as.factor(psmelt$healtyh_d28)
+
+g2 <- ggplot(data = psmelt, aes(x = healtyh_d28, y = Abundance, fill = OTU)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = OTU), height = 0, width = .3) +
+  labs(x = "", y = "Abundance\n", title = "Healthy vs. d28 nasal microbiome: Genera") +
+  facet_wrap(~ OTU, scales = "free")+
+  theme_bw()+
+  scale_fill_viridis(discrete = TRUE, alpha = 0.7, option="viridis")+
+  scale_color_viridis(discrete = TRUE, alpha = 0.7, option="viridis")
+psmelt2 <- psmelt
+```
+
+```{r}
+#| fig-width: 8
+#| fig-length: 8
+#| fig-cap: "Bray-Curtis analysis nasal"
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+gg2 <- ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=padj)) + 
+  geom_point(size=6) + 
+  scale_x_discrete(guide = guide_axis(angle = -90))+
+  theme_bw()+
+  labs(title="healthy vs. d28")+
+  scale_color_viridis()
+```
+
+```{r}
+# now we do the differential abundance analysis with the DESeq2 package
+# we
+ASV_d90_healthy <- subset_samples(ASV_physeq, !is.na(healthy_d90))
+sample_data(ASV_d90_healthy)$healthy_d90 <- as.factor(sample_data(ASV_d90_healthy)$healthy_d90)
+# first we design a deseq2 object
+diagdds = phyloseq_to_deseq2(ASV_d90_healthy, ~ healthy_d90)
+diagdds = DESeq(diagdds, test="Wald", fitType="parametric")
+
+res = results(diagdds, cooksCutoff = FALSE)
+alpha = 0.01
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ASV_physeq)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+``` 
+
+```{r}
+#| fig-width: 8
+#| fig-length: 8
+# we add the siginificant ASV levels to our source data and plot the genus levels
+MR_nasal <- count_tab_nasal[rownames(count_tab_nasal) %in% sigtab$ASV, ]
+MR_tax_nasal <- tax_tab[rownames(tax_tab) %in% sigtab$ASV, ]
+
+MR_count <- otu_table(MR_nasal, taxa_are_rows=T)
+MR_tax <- tax_table(MR_tax_nasal)
+sample_info_tab_phy <- sample_data(sample_info_tab)
+
+MR_phy <- phyloseq(MR_count, MR_tax, sample_info_tab_phy)
+transform <- microbiome::transform
+pseq <- transform(MR_phy, "compositional")
+pseq <- aggregate_rare(pseq, level = "Genus", detection = 1/100, prevalence = 20/100)
+
+ps <- tax_glom(pseq, "Genus")
+taxa_names(ps) <- tax_table(ps)[, "Genus"]
+
+psmelt <- psmelt(ps)
+psmelt <- psmelt[!is.na(psmelt$healthy_d90),]
+psmelt$healthy_d90 <- as.factor(psmelt$healthy_d90)
+
+g3 <- ggplot(data = psmelt, aes(x = healthy_d90, y = Abundance, fill = OTU)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = OTU), height = 0, width = .3) +
+  labs(x = "", y = "Abundance\n", title = "Healthy vs. d90 nasal microbiome: Genera") +
+  facet_wrap(~ OTU, scales = "free")+
+  theme_bw()+
+  scale_fill_viridis(discrete = TRUE, alpha = 0.7, option="viridis")+
+  scale_color_viridis(discrete = TRUE, alpha = 0.7, option="viridis")
+psmelt3 <- psmelt
+```
+
+```{r}
+#| fig-width: 8
+#| fig-length: 8
+#| fig-cap: "Bray-Curtis analysis nasal"
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+gg3 <- ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=padj)) + 
+  geom_point(size=6) + 
+  scale_x_discrete(guide = guide_axis(angle = -90))+
+  theme_bw()+
+  labs(title="healthy vs. d90")+
+  scale_color_viridis()
+```
+
+
+```{r}
+# now we do the differential abundance analysis with the DESeq2 package
+# we
+ASV_d180_healthy <- subset_samples(ASV_physeq, !is.na(healthy_d180))
+sample_data(ASV_d180_healthy)$healthy_d180 <- as.factor(sample_data(ASV_d180_healthy)$healthy_d180)
+# first we design a deseq2 object
+diagdds = phyloseq_to_deseq2(ASV_d180_healthy, ~ healthy_d180)
+diagdds = DESeq(diagdds, test="Wald", fitType="parametric")
+
+res = results(diagdds, cooksCutoff = FALSE)
+alpha = 0.01
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ASV_physeq)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+``` 
+
+```{r}
+#| fig-width: 8
+#| fig-length: 8
+# we add the siginificant ASV levels to our source data and plot the genus levels
+MR_nasal <- count_tab_nasal[rownames(count_tab_nasal) %in% sigtab$ASV, ]
+MR_tax_nasal <- tax_tab[rownames(tax_tab) %in% sigtab$ASV, ]
+
+MR_count <- otu_table(MR_nasal, taxa_are_rows=T)
+MR_tax <- tax_table(MR_tax_nasal)
+sample_info_tab_phy <- sample_data(sample_info_tab)
+
+MR_phy <- phyloseq(MR_count, MR_tax, sample_info_tab_phy)
+transform <- microbiome::transform
+pseq <- transform(MR_phy, "compositional")
+pseq <- aggregate_rare(pseq, level = "Genus", detection = 1/100, prevalence = 20/100)
+
+ps <- tax_glom(pseq, "Genus")
+taxa_names(ps) <- tax_table(ps)[, "Genus"]
+
+psmelt <- psmelt(ps)
+psmelt <- psmelt[!is.na(psmelt$healthy_d180),]
+psmelt$healthy_d180 <- as.factor(psmelt$healthy_d180)
+
+g4 <- ggplot(data = psmelt, aes(x = healthy_d180, y = Abundance, fill = OTU)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = OTU), height = 0, width = .3) +
+  labs(x = "", y = "Abundance\n", title = "Healthy vs. d90 nasal microbiome: Genera") +
+  facet_wrap(~ OTU, scales = "free")+
+  theme_bw()+
+  scale_fill_viridis(discrete = TRUE, alpha = 0.7, option="viridis")+
+  scale_color_viridis(discrete = TRUE, alpha = 0.7, option="viridis")
+psmelt4 <- psmelt
+```
+
+```{r}
+#| fig-width: 8
+#| fig-length: 8
+#| fig-cap: "Bray-Curtis analysis nasal"
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+gg4 <- ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=padj)) + 
+  geom_point(size=6) + 
+  scale_x_discrete(guide = guide_axis(angle = -90))+
+  theme_bw()+
+  labs(title="healthy vs. d180")+
+  scale_color_viridis()
+```
+
+```{r}
+#| fig-width: 15
+#| fig-length: 20
+gustav <- ggarrange(gg1, gg2, gg3, gg4, nrow = 1, ncol = 4)
+gustav
+```
+
+```{r}
+#| fig-width: 15
+#| fig-length: 25
+gustav2 <- ggarrange(g1, g2, g3, g4, nrow = 1, ncol = 4)
+gustav2
+```
+
+# abundance analysis Wilcoxan Test Nasal Microbiome
+
+```{r}
+#| fig-width: 15
+#| fig-length: 20
+#| fig-cap: 
+transform <- microbiome::transform
+pseq <- transform(ASV_physeq, "compositional")
+pseq <- aggregate_rare(pseq, level = "Genus", detection = 1/100, prevalence = 10/100)
+
+ps <- tax_glom(pseq, "Genus")
+taxa_names(ps) <- tax_table(ps)[, "Genus"]
+
+psmelt <- psmelt(ps)
+
+psmelt_gesamt <- psmelt %>% filter(OTU %in% c("Staphylococcus", "Dolosigranulum", "Corynebacterium", "Lactobacillus", "Lawsonella", "Cutibacterium"))
+
+my_comparisons = list(c("healthy", "0"), c("healthy", "28"), c("healthy", "90"), c("healthy", "180"), c("0", "28"), c("0", "90"), c("0", "180"))
+
+gesamt <- ggplot(data = psmelt_gesamt, aes(x = Time, y = Abundance)) +
+  geom_boxplot(outlier.shape = NA, aes(fill = OTU)) +
+  geom_jitter(aes(color = OTU), height = 0, width = .3) +
+  labs(x = "", y = "Abundance\n", title = "Most abundant Genera") +
+  theme_bw()+
+  facet_wrap(~ OTU, scales = "free")+
+  stat_compare_means(comparison = my_comparisons, method = "wilcox", label = "p.signif", step.increase = 0.06)+
+  #stat_compare_means(aes(group = OTU), method = "wilcox", label = "p.signif", step.increase = 0.06,
+                     #comparisons = list(c("healthy", "0"), c("healthy", "28"), c("healthy", "90"), c("healthy", "180"), c("0", "28"), c("0", "90"), c("0", "180"))) +
+  scale_fill_viridis(discrete = TRUE, alpha = 0.7, option="viridis")+
+  scale_color_viridis(discrete = TRUE, alpha = 0.7, option="viridis")
+gesamt
+```
+```{r}
+statistics <- compare_means(Abundance ~ Time, psmelt_gesamt, group.by = "OTU", method = "wilcox.test", p.adjust.method = "holm")
+statistics
+```
+
+# abundance analysis Wilcoxan Test Gut Microbiome
+
+```{r}
+#| fig-width: 15
+#| fig-length: 20
+#| fig-cap: gut microbiome
+transform <- microbiome::transform
+pseq <- transform(ASV_physeq_stool, "compositional")
+pseq <- aggregate_rare(pseq, level = "Genus", detection = 5/100, prevalence = 10/100)
+
+ps <- tax_glom(pseq, "Genus")
+taxa_names(ps) <- tax_table(ps)[, "Genus"]
+
+psmelt <- psmelt(ps)
+
+psmelt_gesamt <- psmelt %>% filter(OTU %in% c("Bifidobacterium", "Bacteroides", "Faecalibacterium", "Prevotella_9", "Collinsella", "Blautia"))
+
+my_comparisons = list(c("healthy", "0"), c("healthy", "28"), c("healthy", "90"), c("healthy", "180"), c("0", "28"), c("0", "90"), c("0", "180"))
+
+gesamt1 <- ggplot(data = psmelt_gesamt, aes(x = Time, y = Abundance)) +
+  geom_boxplot(outlier.shape = NA, aes(fill = OTU)) +
+  geom_jitter(aes(color = OTU), height = 0, width = .3) +
+  labs(x = "", y = "Abundance\n", title = "Most abundant Genera") +
+  theme_bw()+
+  facet_wrap(~ OTU, scales = "free")+
+  stat_compare_means(comparison = my_comparisons, method = "wilcox", label = "p.signif", step.increase = 0.06)+
+  #stat_compare_means(aes(group = OTU), method = "wilcox", label = "p.signif", step.increase = 0.06,
+                     #comparisons = list(c("healthy", "0"), c("healthy", "28"), c("healthy", "90"), c("healthy", "180"), c("0", "28"), c("0", "90"), c("0", "180"))) +
+  scale_fill_viridis(discrete = TRUE, alpha = 0.7, option="viridis")+
+  scale_color_viridis(discrete = TRUE, alpha = 0.7, option="viridis")
+gesamt1
+```
+```{r}
+statistics1 <- compare_means(Abundance ~ Time, psmelt_gesamt, group.by = "OTU", method = "wilcox.test", p.adjust.method = "holm")
+statistics1
+```
+
+# AIC logistic regression
+
+```{r}
+psmeltwider <- pivot_wider(psmelt, names_from = OTU, values_from = Abundance)
+psmeltwider_healthy <- psmeltwider[!is.na(psmeltwider$CRS_healthy),]
+model1 <- glm(CRS_healthy ~ Staphylococcus+Corynebacterium+Moraxella, data = psmeltwider_healthy, na.action = na.omit)
+              
+              +Other+Haemophilus+Streptococcus+Dolosigranulum+Unknown+
+              `Lachnospiraceae NK4A136 group`+Lawsonella+`Escherichia-Shigella`+Peptoniphilus+Anaerococcus+Cutibacterium+
+               Finegoldia+Lactobacillus+Bacteroides+Lactiplantibacillus+Alloprevotella, data = psmeltwider, na.action = na.exclude)
+
+```
+
+```{r}
+# now we do the differential abundance analysis with the DESeq2 package
+# we
+ASV_d0_d28 <- subset_samples(ASV_physeq, !is.na(d0_d28))
+sample_data(ASV_d0_d28)$d0_d28 <- as.factor(sample_data(ASV_d0_d28)$d0_d28)
+# first we design a deseq2 object
+diagdds = phyloseq_to_deseq2(ASV_d0_d28, ~ d0_d28)
+diagdds = DESeq(diagdds, test="Wald", fitType="parametric")
+
+res = results(diagdds, cooksCutoff = FALSE)
+alpha = 0.01
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ASV_physeq)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+``` 
